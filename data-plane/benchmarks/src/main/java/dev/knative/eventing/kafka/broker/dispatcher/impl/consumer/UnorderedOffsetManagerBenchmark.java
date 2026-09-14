@@ -163,6 +163,11 @@ public class UnorderedOffsetManagerBenchmark {
         }
 
         @Override
+        public Future<Void> unsubscribe() {
+            return null;
+        }
+
+        @Override
         public Consumer<String, CloudEvent> unwrap() {
             return null;
         }

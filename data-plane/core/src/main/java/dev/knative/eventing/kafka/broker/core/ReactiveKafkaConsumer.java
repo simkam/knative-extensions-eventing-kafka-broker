@@ -91,6 +91,15 @@ public interface ReactiveKafkaConsumer<K, V> {
     Future<Void> subscribe(Collection<String> topics, ConsumerRebalanceListener listener);
 
     /**
+     * Unsubscribes from all topics, sending an immediate LeaveGroup request to the
+     * Kafka broker. Call this eagerly on shutdown to minimise the zombie consumer
+     * group window before the record-dispatcher drain completes.
+     *
+     * @return A future indicating the success or failure of the unsubscribe operation.
+     */
+    Future<Void> unsubscribe();
+
+    /**
      * Retrieves the underlying Kafka Consumer instance.
      *
      * @return The KafkaConsumer instance.

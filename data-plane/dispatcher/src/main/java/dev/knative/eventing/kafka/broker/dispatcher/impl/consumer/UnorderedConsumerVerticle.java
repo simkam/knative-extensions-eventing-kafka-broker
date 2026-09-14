@@ -120,8 +120,8 @@ public final class UnorderedConsumerVerticle extends ConsumerVerticle {
                     .poll(POLL_TIMEOUT)
                     .onSuccess(records -> vertx.runOnContext(v -> this.handleRecords(records)))
                     .onFailure(cause -> {
-                        if (cause instanceof WakeupException) {
-                            return; // Do nothing we're shutting down
+                        if (cause instanceof WakeupException || closed.get()) {
+                            return; // Consumer is shutting down
                         }
 
                         isPollInFlight.set(false);

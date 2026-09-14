@@ -29,6 +29,7 @@ import dev.knative.eventing.kafka.broker.core.observability.metrics.Metrics;
 import dev.knative.eventing.kafka.broker.dispatcher.CloudEventSender;
 import dev.knative.eventing.kafka.broker.dispatcher.CloudEventSenderMock;
 import dev.knative.eventing.kafka.broker.dispatcher.MockReactiveKafkaConsumer;
+import dev.knative.eventing.kafka.broker.dispatcher.RecordDispatcher;
 import dev.knative.eventing.kafka.broker.dispatcher.ResponseHandlerMock;
 import dev.knative.eventing.kafka.broker.dispatcher.impl.RecordDispatcherImpl;
 import dev.knative.eventing.kafka.broker.dispatcher.impl.RecordDispatcherTest;
@@ -49,6 +50,7 @@ import java.util.Set;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.stream.Collectors;
 import org.apache.kafka.clients.consumer.ConsumerRebalanceListener;
+import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.apache.kafka.clients.consumer.MockConsumer;
 import org.apache.kafka.clients.consumer.OffsetResetStrategy;
 import org.apache.kafka.common.TopicPartition;
@@ -174,6 +176,7 @@ public abstract class AbstractConsumerVerticleTest {
         final var checkpoints = context.checkpoint(2);
 
         when(consumer.close()).thenReturn(Future.succeededFuture());
+        when(consumer.unsubscribe()).thenReturn(Future.succeededFuture());
         when(consumer.subscribe((Set<String>) any(), any(ConsumerRebalanceListener.class)))
                 .thenReturn(Future.succeededFuture());
         when(consumer.subscribe(any(Set.class))).thenReturn(Future.succeededFuture());
@@ -242,9 +245,143 @@ public abstract class AbstractConsumerVerticleTest {
                 })));
 
         await().untilAsserted(() -> {
+            verify(consumer, times(1)).unsubscribe();
             verify(consumer, times(1)).close();
         });
         checkpoints.flag();
+    }
+
+    @Test
+    @SuppressWarnings("unchecked")
+    public void unsubscribeOccursBeforeDispatcherDrain(final Vertx vertx, final VertxTestContext context) {
+        final var unsubscribedBeforeDrain = new AtomicBoolean(false);
+
+        final MockReactiveKafkaConsumer<Object, CloudEvent> consumer = mock(MockReactiveKafkaConsumer.class);
+        when(consumer.unsubscribe()).thenAnswer(inv -> {
+            unsubscribedBeforeDrain.set(true);
+            return Future.succeededFuture();
+        });
+        when(consumer.close()).thenReturn(Future.succeededFuture());
+        when(consumer.subscribe((Set<String>) any(), any(ConsumerRebalanceListener.class)))
+                .thenReturn(Future.succeededFuture());
+        when(consumer.subscribe(any(Set.class))).thenReturn(Future.succeededFuture());
+        when(consumer.poll(any())).then(answer -> {
+            final Duration duration = answer.getArgument(0);
+            Promise<Void> promise = Promise.promise();
+            vertx.setTimer(duration.toMillis(), v -> promise.complete());
+            return promise.future();
+        });
+        when(consumer.unwrap()).thenReturn(new MockConsumer<>(OffsetResetStrategy.LATEST));
+
+        final var drainCalled = new AtomicBoolean(false);
+        final RecordDispatcher recordDispatcher = new RecordDispatcher() {
+            @Override
+            public Future<Void> dispatch(ConsumerRecord<Object, CloudEvent> record) {
+                return Future.succeededFuture();
+            }
+
+            @Override
+            public Future<Void> close() {
+                drainCalled.set(true);
+                context.verify(() -> assertThat(unsubscribedBeforeDrain.get())
+                        .as("unsubscribe() must be called before the dispatcher drain begins")
+                        .isTrue());
+                return Future.succeededFuture();
+            }
+        };
+
+        final var verticle = createConsumerVerticle(FakeConsumerVerticleContext.get(), (vx, cv) -> {
+            cv.setConsumer(consumer);
+            cv.setRecordDispatcher(recordDispatcher);
+            cv.setCloser(Future::succeededFuture);
+            cv.setRebalanceListener(new ConsumerRebalanceListener() {
+                @Override
+                public void onPartitionsRevoked(final Collection<TopicPartition> partitions) {}
+
+                @Override
+                public void onPartitionsAssigned(final Collection<TopicPartition> partitions) {}
+            });
+            return Future.succeededFuture();
+        });
+
+        vertx.deployVerticle(verticle)
+                .onSuccess(id -> vertx.undeploy(id)
+                        .onSuccess(ignored -> context.verify(() -> {
+                            assertThat(drainCalled.get()).isTrue();
+                            context.completeNow();
+                        }))
+                        .onFailure(context::failNow))
+                .onFailure(context::failNow);
+    }
+
+    @Test
+    @SuppressWarnings("unchecked")
+    public void failedUnsubscribeFallsBackToImmediateClose(final Vertx vertx, final VertxTestContext context) {
+        final var closeCalled = new AtomicBoolean(false);
+        final Promise<Void> drainGate = Promise.promise();
+
+        final MockReactiveKafkaConsumer<Object, CloudEvent> consumer = mock(MockReactiveKafkaConsumer.class);
+        when(consumer.unsubscribe()).thenReturn(Future.failedFuture("simulated unsubscribe failure"));
+        when(consumer.close()).thenAnswer(inv -> {
+            closeCalled.set(true);
+            return Future.succeededFuture();
+        });
+        when(consumer.subscribe((Set<String>) any(), any(ConsumerRebalanceListener.class)))
+                .thenReturn(Future.succeededFuture());
+        when(consumer.subscribe(any(Set.class))).thenReturn(Future.succeededFuture());
+        when(consumer.poll(any())).then(answer -> {
+            final Duration duration = answer.getArgument(0);
+            Promise<Void> promise = Promise.promise();
+            vertx.setTimer(duration.toMillis(), v -> promise.complete());
+            return promise.future();
+        });
+        when(consumer.unwrap()).thenReturn(new MockConsumer<>(OffsetResetStrategy.LATEST));
+
+        final RecordDispatcher slowDrain = new RecordDispatcher() {
+            @Override
+            public Future<Void> dispatch(ConsumerRecord<Object, CloudEvent> record) {
+                return Future.succeededFuture();
+            }
+
+            @Override
+            public Future<Void> close() {
+                return drainGate.future();
+            }
+        };
+
+        final var verticle = createConsumerVerticle(FakeConsumerVerticleContext.get(), (vx, cv) -> {
+            cv.setConsumer(consumer);
+            cv.setRecordDispatcher(slowDrain);
+            cv.setCloser(Future::succeededFuture);
+            cv.setRebalanceListener(new ConsumerRebalanceListener() {
+                @Override
+                public void onPartitionsRevoked(final Collection<TopicPartition> partitions) {}
+
+                @Override
+                public void onPartitionsAssigned(final Collection<TopicPartition> partitions) {}
+            });
+            return Future.succeededFuture();
+        });
+
+        final Promise<String> deployPromise = Promise.promise();
+        vertx.deployVerticle(verticle, deployPromise);
+
+        final Promise<Void> undeployPromise = Promise.promise();
+        deployPromise
+                .future()
+                .onSuccess(id -> vertx.undeploy(id, undeployPromise))
+                .onFailure(context::failNow);
+        undeployPromise.future().onFailure(context::failNow);
+
+        // close() must be called before the drain gate is released
+        await().until(closeCalled::get);
+        assertThat(drainGate.future().isComplete())
+                .as("consumer.close() must be called before the dispatcher drain completes")
+                .isFalse();
+
+        drainGate.complete();
+        await().until(() -> undeployPromise.future().isComplete());
+        context.completeNow();
     }
 
     abstract ConsumerVerticle createConsumerVerticle(

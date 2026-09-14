@@ -67,12 +67,28 @@ public abstract class ConsumerVerticle extends AbstractVerticle {
     public void stop(Promise<Void> stopPromise) {
         logger.info("Stopping consumer verticle {}", consumerVerticleContext.getLoggingKeyValue());
 
-        AsyncCloseable.compose(this.recordDispatcher, this.closeable, this.consumer::close)
-                .close()
-                .onComplete(r -> {
-                    stopPromise.tryComplete();
-                    logger.info("Consumer verticle closed {}", consumerVerticleContext.getLoggingKeyValue());
-                });
+        // Send LeaveGroup immediately so the Kafka broker removes this consumer
+        // from the group right away, before the (potentially slow) drain of
+        // in-flight HTTP dispatches in recordDispatcher.close(). Without this
+        // eager unsubscribe the consumer group remains active ("zombie") for as
+        // long as the drain takes — up to DEFAULT_TIMEOUT_MS (600 s) per request.
+        consumer.unsubscribe()
+                .onFailure(err -> {
+                    // Unsubscribe failed; close immediately so LoomKafkaConsumer's close
+                    // task fires the LeaveGroup without waiting for the dispatcher drain.
+                    logger.warn(
+                            "Eager unsubscribe failed, falling back to close to trigger LeaveGroup {}: {}",
+                            consumerVerticleContext.getLoggingKeyValue(),
+                            err.getMessage());
+                    consumer.close();
+                })
+                .onComplete(ignored -> AsyncCloseable.compose(
+                                this.recordDispatcher, this.closeable, this.consumer::close)
+                        .close()
+                        .onComplete(r -> {
+                            stopPromise.tryComplete();
+                            logger.info("Consumer verticle closed {}", consumerVerticleContext.getLoggingKeyValue());
+                        }));
     }
 
     public void setConsumer(ReactiveKafkaConsumer<Object, CloudEvent> consumer) {

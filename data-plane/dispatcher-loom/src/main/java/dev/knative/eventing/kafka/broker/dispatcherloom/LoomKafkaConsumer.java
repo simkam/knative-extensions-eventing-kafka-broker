@@ -27,7 +27,6 @@ import java.util.Collection;
 import java.util.Map;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.LinkedBlockingQueue;
-import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import org.apache.kafka.clients.consumer.Consumer;
 import org.apache.kafka.clients.consumer.ConsumerRebalanceListener;
@@ -42,9 +41,15 @@ public class LoomKafkaConsumer<K, V> implements ReactiveKafkaConsumer<K, V> {
 
     private static final Logger logger = LoggerFactory.getLogger(LoomKafkaConsumer.class);
 
+    // Sentinel enqueued as the very last task so the task runner exits cleanly.
+    private static final Runnable STOP_SENTINEL = () -> {};
+
     private final Consumer<K, V> consumer;
     private final BlockingQueue<Runnable> taskQueue;
     private final AtomicBoolean isClosed;
+    // Guards the isClosed check + taskQueue.add pair in both addTask() and close()
+    // so that no user task can be enqueued after the STOP_SENTINEL.
+    private final Object taskAddLock = new Object();
     private final Thread taskRunnerThread;
     private final Promise<Void> closePromise = Promise.promise();
 
@@ -62,21 +67,23 @@ public class LoomKafkaConsumer<K, V> implements ReactiveKafkaConsumer<K, V> {
     }
 
     private void addTask(Runnable task, Promise<?> promise) {
-        if (isClosed.get()) {
-            promise.fail("Consumer is closed");
-            return;
+        synchronized (taskAddLock) {
+            if (isClosed.get()) {
+                promise.fail("Consumer is closed");
+                return;
+            }
+            taskQueue.add(task);
         }
-        taskQueue.add(task);
     }
 
     private void processTaskQueue() {
-        // Process queue elements until this is closed and the tasks queue is empty
-        while (!isClosed.get() || !taskQueue.isEmpty()) {
+        while (true) {
             try {
-                Runnable task = taskQueue.poll(2000, TimeUnit.MILLISECONDS);
-                if (task != null) {
-                    task.run();
+                Runnable task = taskQueue.take();
+                if (task == STOP_SENTINEL) {
+                    break;
                 }
+                task.run();
             } catch (InterruptedException e) {
                 logger.debug("Interrupted while waiting for task", e);
                 break;
@@ -102,42 +109,47 @@ public class LoomKafkaConsumer<K, V> implements ReactiveKafkaConsumer<K, V> {
 
     @Override
     public Future<Void> close() {
-        if (!this.isClosed.compareAndSet(false, true)) {
-            return closePromise.future();
+        synchronized (taskAddLock) {
+            if (!this.isClosed.compareAndSet(false, true)) {
+                return closePromise.future();
+            }
+            taskQueue.add(() -> {
+                logger.debug("Closing underlying Kafka consumer client");
+                // Explicitly unsubscribe before close to trigger an immediate
+                // LeaveGroup request, preventing zombie consumer group membership.
+                // close() is in finally so it always runs even if unsubscribe throws.
+                try {
+                    try {
+                        consumer.unsubscribe();
+                    } finally {
+                        consumer.close();
+                    }
+                } catch (Exception e) {
+                    closePromise.tryFail(e);
+                }
+            });
+            // STOP_SENTINEL is enqueued under the same lock as the close task and
+            // isClosed=true, so no user task can be added between them.
+            taskQueue.add(STOP_SENTINEL);
         }
 
-        taskQueue.add(() -> {
-            try {
-                logger.debug("Closing underlying Kafka consumer client");
-                consumer.wakeup();
-                consumer.close();
-            } catch (Exception e) {
-                closePromise.tryFail(e);
-            }
-        });
+        // Interrupt any blocking poll() executing ahead of the close task.
+        // wakeup() is called outside the lock — it is thread-safe and only needs
+        // to happen after the close task is already in the queue.
+        consumer.wakeup();
 
         logger.debug("Closing consumer {}", keyValue("size", taskQueue.size()));
 
         Thread.ofVirtual().start(() -> {
             try {
-                while (!taskQueue.isEmpty()) {
-                    logger.debug("Queue is not empty {}", keyValue("taskQueue.size", taskQueue.size()));
-                    Thread.sleep(2000L);
-                }
-                logger.debug("Queue is empty");
-
+                // The task runner exits after processing STOP_SENTINEL; join it
+                // here so closePromise is resolved only after consumer.close() returns.
                 taskRunnerThread.join();
                 closePromise.tryComplete();
-
                 logger.debug("Background thread completed");
-
             } catch (InterruptedException e) {
-                final var size = taskQueue.size();
-                logger.debug(
-                        "Interrupted while waiting for taskRunnerThread to finish {}",
-                        keyValue("taskQueueSize", size),
-                        e);
-                closePromise.tryFail(new InterruptedException("taskQueue.size = " + size + ". " + e.getMessage()));
+                logger.debug("Interrupted while waiting for taskRunnerThread to finish", e);
+                closePromise.tryFail(e);
             }
         });
 
@@ -183,6 +195,22 @@ public class LoomKafkaConsumer<K, V> implements ReactiveKafkaConsumer<K, V> {
                 () -> {
                     try {
                         consumer.resume(partitions);
+                        promise.complete();
+                    } catch (Exception e) {
+                        promise.fail(e);
+                    }
+                },
+                promise);
+        return promise.future();
+    }
+
+    @Override
+    public Future<Void> unsubscribe() {
+        final Promise<Void> promise = Promise.promise();
+        addTask(
+                () -> {
+                    try {
+                        consumer.unsubscribe();
                         promise.complete();
                     } catch (Exception e) {
                         promise.fail(e);

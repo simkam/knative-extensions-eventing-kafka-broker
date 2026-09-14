@@ -72,6 +72,12 @@ public class MockReactiveKafkaConsumer<K, V> implements ReactiveKafkaConsumer<K,
     }
 
     @Override
+    public Future<Void> unsubscribe() {
+        consumer.unsubscribe();
+        return Future.succeededFuture();
+    }
+
+    @Override
     public Future<Void> resume(Collection<TopicPartition> partitions) {
         consumer.resume(partitions);
         return Future.succeededFuture();

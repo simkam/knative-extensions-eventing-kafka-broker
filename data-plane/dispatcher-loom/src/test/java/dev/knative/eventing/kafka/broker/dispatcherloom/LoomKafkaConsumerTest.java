@@ -29,6 +29,7 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicBoolean;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.apache.kafka.clients.consumer.MockConsumer;
 import org.apache.kafka.clients.consumer.OffsetAndMetadata;
@@ -172,6 +173,71 @@ public class LoomKafkaConsumerTest {
                     assertEquals(offsetMap, result);
                     testContext.completeNow();
                 }))
+                .onFailure(testContext::failNow);
+    }
+
+    @Test
+    public void testUnsubscribeCompletesViaDedicatedTask(VertxTestContext testContext) {
+        final var checkpoints = testContext.checkpoint();
+        final var unsubscribeCalled = new AtomicBoolean(false);
+
+        final MockConsumer<String, Integer> trackingConsumer = new MockConsumer<>(OffsetResetStrategy.LATEST) {
+            @Override
+            public synchronized void unsubscribe() {
+                unsubscribeCalled.set(true);
+                super.unsubscribe();
+            }
+        };
+
+        final LoomKafkaConsumer<String, Integer> loomConsumer = new LoomKafkaConsumer<>(vertx, trackingConsumer);
+
+        loomConsumer
+                .subscribe(Collections.singletonList("test-topic"))
+                .compose(ignored -> loomConsumer.unsubscribe())
+                .compose(ignored -> loomConsumer.close())
+                .onComplete(ar -> {
+                    testContext.verify(() ->
+                            assertTrue(unsubscribeCalled.get(), "unsubscribe() must be called via the task queue"));
+                    checkpoints.flag();
+                })
+                .onFailure(testContext::failNow);
+    }
+
+    @Test
+    public void testUnsubscribeCalledBeforeClose(VertxTestContext testContext) {
+        final var checkpoints = testContext.checkpoint();
+        final var unsubscribeCalled = new AtomicBoolean(false);
+        final var unsubscribedBeforeClose = new AtomicBoolean(false);
+
+        final MockConsumer<String, Integer> trackingConsumer = new MockConsumer<>(OffsetResetStrategy.LATEST) {
+            @Override
+            public synchronized void unsubscribe() {
+                unsubscribeCalled.set(true);
+                super.unsubscribe();
+            }
+
+            @Override
+            public void close() {
+                unsubscribedBeforeClose.set(unsubscribeCalled.get());
+                super.close();
+            }
+        };
+
+        final LoomKafkaConsumer<String, Integer> trackingConsumerWrapper =
+                new LoomKafkaConsumer<>(vertx, trackingConsumer);
+
+        trackingConsumerWrapper
+                .subscribe(Collections.singletonList("test-topic"))
+                .compose(ignored -> trackingConsumerWrapper.close())
+                .onComplete(ar -> {
+                    testContext.verify(() -> {
+                        assertTrue(unsubscribeCalled.get(), "unsubscribe() must be called during close");
+                        assertTrue(
+                                unsubscribedBeforeClose.get(),
+                                "unsubscribe() must be called before close() to trigger immediate LeaveGroup");
+                    });
+                    checkpoints.flag();
+                })
                 .onFailure(testContext::failNow);
     }
 
